@@ -1,0 +1,868 @@
+---
+title: "QC (all deliveries)"
+output: html_document
+date: "2024-06-26"
+---
+
+# Summary
+This is a data cleaning script that checks variables, derives any new variables required and reduces some of the nesting in the data frame.
+The returned data object contains data on all deliveries. 
+Each row is a distinct mother/child pair.
+
+The data is very nested.
+Each mother can have:
+* multiple deliveries
+* multiple births per delivery
+* multiple hospital admissions
+* multiple ICD-10 codes per each hospital admission
+* multiple demographic data for different time periods
+
+There are also variables that shouldn't be nested.
+eg. some mothers have multiple different dates of birth, different ethnicity group codes...
+
+# Some handy variable combinations to define mothers, deliveries and births
+* `MAT_ALF_PE` defines mothers.
+* A combination of `MAT_ALF_PE` and `WOB` (week of birth) defines deliveries.
+* A combination of `MAT_ALF_PE` and `CHILD_ID_PE` defines births.
+
+
+# Variables required for demographic table:
+
+Cases:
+* deliveries followed by psychosis within 14 weeks 
+* deliveries followed by psychosis 14-52 weeks 
+* all other deliveries (including those with psychosis \> 52 weeks)
+
+1.  Maternal age, converted to a categorical variable
+2.  Parity (same as delivery number)
+3.  Still birth (categorical)
+4.  Mode of delivery (categorical)
+5.  Gestational age, converted to categorical
+6.  Birthweight (categorical)
+7.  Child's sex (categorical)
+8.  Multiple births (categorical, yes/no)
+9.  Maternal ethnicity (categorical)
+10. Maternal deprivation at time of birth - quintiles, compare WIMD and
+    Townsend (categorical)
+    - look at most recent deprivation code
+    - check the difference in time between WOB and available deprivation code
+    - go backwards first, then forwards if WOB not between dep data
+    - check how much people change deprivation codes
+
+```{r}
+library(data.table)
+library(dplyr)
+library(stringr)
+library(pbapply)
+library(ggplot2)
+library(naniar)
+library(lubridate)
+library(sailr)
+
+# Set random seed
+set.seed(1234567)
+
+# Set path to output in git repo
+# for Amelia:
+outputPath <- "P:/edmondsa/eclipse-workspace/main-repository-for-1515/Output/Plots_data_check/QC_all_del_Rmd"
+# for Katie:
+# outputPath <- "P:/marwickk/workspace/Postpartum psychosis 1515/main-repository-for-1515/Output/Plots_Data_Check/QC_all_del_Rmd"
+
+```
+
+# Data preparation
+1.  Read in the data
+
+```{r}
+data_all <- fread("S:/1515 - Postpartum psychosis- physical and mental comorbidity in a national linked d/Exports_from_Eclipse/flat_table_all_del.csv")
+
+nrow(data_all)
+# Should match with number from SQL script (make_flat_table.sql)
+
+```
+
+## Check date format for date columns
+```{r}
+# sapply(data_all, class)
+
+# WOB, PEDW_START_DATE, PEDW_END_DATE, START_DATE, END_DATE
+# DOD_CHILD_NCCH and DOD_MOTHER_ADDE should also be date columns but are class character here
+
+data_all <- data_all %>%
+  mutate(across(starts_with("DOD_"), ~ as.IDate(.x)))
+
+```
+
+## Numbers of mothers and births
+```{r}
+# Number of mothers
+data_all %>%
+   distinct(MAT_ALF_PE,  .keep_all = TRUE) %>%
+  nrow() # Should match with number from SQL script (make_flat_table.sql)
+
+# Number of births (ie. mother child combinations)
+data_all %>%
+   distinct(MAT_ALF_PE, CHILD_ID_PE,  .keep_all = TRUE) %>%
+  nrow() # Should match with number from SQL script (make_flat_table.sql)
+
+```
+
+## Check delivery number is correct 
+```{r}
+# This was calculated in SQL but hasn't been checked yet
+# The SQL code to do this was: DENSE_RANK() OVER (PARTITION BY NCCH_BIRTHS.MAT_ALF_PE ORDER BY NCCH_BIRTHS.WOB) AS DELIVERY_NUM
+# NOTE: it's really important we used DENSE_RANK() not RANK() to do this, see notes in the SQL script.
+
+# Calculate delivery number in R and compare to that derived in SQL
+tmp <- data_all %>%
+  slice(1:10000) %>%
+  arrange(MAT_ALF_PE, WOB) %>%
+  group_by(MAT_ALF_PE) %>%
+  mutate(DELIVERY_NUM_R = dense_rank(WOB)) %>%
+  select(MAT_ALF_PE, CHILD_ID_PE, WOB, DELIVERY_NUM, DELIVERY_NUM_R, TOT_BIRTH_NUM_DERIVED) %>%
+  distinct(MAT_ALF_PE, CHILD_ID_PE,.keep_all = TRUE)
+
+tmp
+
+# Manually inspect some IDs from the below table to check delivery numbers for multiple births looks sensible
+tmp %>%
+  filter(TOT_BIRTH_NUM_DERIVED > 1 & DELIVERY_NUM > 1)
+
+# SQL and R return the same delivery number. And it looks sensible after manually inspecting some maternal IDs.
+```
+
+## Apply filter to exclude data before early 2000s?
+```{r}
+# Plotting all deliveries over time:
+png(paste0(outputPath, "/all_deliveries_WOB_counts.png"), width = 17, height = 10, units = "cm", res = 300)
+p <- data_all %>%
+  group_by(WOB) %>%
+  summarise(n = n_distinct(MAT_ALF_PE)) %>%
+  filter(n > 300) %>% # remove small counts from plot
+  ggplot(data = .) +
+  geom_point(aes(x = WOB, y = n), alpha = 0.2)+
+  scale_x_date(date_breaks = "1 year", date_labels = "%b %Y") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(x = "Week of birth", y = "Number of deliveries")
+print(p)
+dev.off()
+
+print(p)
+
+# This shift in numbers around 2002 corresponds to less missing maternal IDs from 2002 onwards. As child IDs (which presumably was better recorded) does not show this shift in data around this time point.
+
+# Create a cleaned date version
+data_all_clean_date <- data_all %>%
+  filter(WOB > as.Date('2002-05-01')) # Format is YYYY-MM-DD, so this date is 1st May 2002
+
+```
+
+# Number of mothers and total births after applying date filter
+```{r}
+# Number of mothers
+data_all_clean_date %>%
+   distinct(MAT_ALF_PE,  .keep_all = TRUE) %>%
+  nrow()
+
+# Number of births (ie. mother child combinations)
+data_all_clean_date %>%
+   distinct(MAT_ALF_PE, CHILD_ID_PE,  .keep_all = TRUE) %>%
+  nrow()
+
+```
+
+## Filter to only keep mothers that were a Welsh resident at time of delivery
+- Do you want to keep mothers that have deliveries when they are a Welsh resident for some deliveries but not others? Do you want to remove those mother's deliveries when she is not a Welsh resident?
+- Be very careful with this variable for multiple births especially, as often with the data on multiple births the data regarding delivery is just recorded for the first baby.
+```{r}
+# The variable WELSH_BIRTH_FLG determines if a mother was resident of Wales at time of delivery. 1 is TRUE, 0 is FALSE. 
+
+# Inspect if there's any missing values
+sum(is.na(data_all_clean_date$WELSH_BIRTH_FLG))
+sum(is.null(data_all_clean_date$WELSH_BIRTH_FLG))
+sum((data_all_clean_date$WELSH_BIRTH_FLG == ''))
+
+# Check counts for each value
+data_all_clean_date %>%
+  count(WELSH_BIRTH_FLG)
+
+# Check how many mothers have more than one Welsh birth flag. ie. maybe moving in and out of Wales for multiple deliveries
+data_all_clean_date %>%
+  group_by(MAT_ALF_PE) %>%
+  summarise(Number_of_Welsh_birth_flags = n_distinct(WELSH_BIRTH_FLG)) %>%
+  group_by(Number_of_Welsh_birth_flags) %>%
+  summarise(Number_of_mothers = n())
+
+# Another possibility is that for multiple births data is recorded only for the first child and not for second.
+# Check if within each delivery (ie. where there are multiple births) that there is only one Welsh birth flag.
+data_all_clean_date %>%
+  group_by(MAT_ALF_PE, WOB) %>%
+  summarise(Number_of_Welsh_birth_flags = n_distinct(WELSH_BIRTH_FLG)) %>%
+  group_by(Number_of_Welsh_birth_flags) %>%
+  summarise(Number_of_deliveries = n())
+
+# Investigate further why there are different Welsh birth flags for some deliveries
+welshTmp <- data_all_clean_date %>%
+  group_by(MAT_ALF_PE, WOB) %>%
+  summarise(Number_of_Welsh_birth_flags = n_distinct(WELSH_BIRTH_FLG)) %>%
+  filter(Number_of_Welsh_birth_flags == 2)
+
+# Count number of unique child IDs for deliveries that have 2 different welsh birth flags (ie. 0 and 1)
+sapply(1:50, function(i){
+  data_all_clean_date %>%
+  filter(MAT_ALF_PE == welshTmp$MAT_ALF_PE[i] & WOB == welshTmp$WOB[i]) %>%
+  pull(CHILD_ID_PE) %>%
+  unique() %>%
+  length()
+})
+# Just checked the first 50 but these are all for deliveries of multiple births
+
+# Need to think carefully about how to code WELSH_BIRTH_FLAG when it's not clear what it should be within a delivery
+# And check carefully if it's true about being recorded as 1 for first birth, but 0 for subsequent births.
+```
+
+# Derive age from maternal week of birth (WOB) and child week of birth and compare to the age provided as a variable by SAIL
+Check the MAT_WOB col, some mothers have multiple WOBs which would make checking MAT_AGE tricky...
+```{r MAT_WOB}
+
+data_all_clean_date %>%
+  ggplot(data = ., aes(x = MAT_AGE)) +
+  geom_bar()
+
+data_all_clean_date %>%
+  group_by(MAT_ALF_PE) %>%
+  summarise(distinct_count = n_distinct(MAT_WOB)) %>%
+  count(distinct_count)
+# Quite a few mothers have more than one WOB
+
+data_all_clean_date %>%
+  group_by(MAT_ALF_PE, WOB) %>%
+  summarise(distinct_count = n_distinct(MAT_AGE)) %>%
+  group_by(distinct_count) %>%
+  count()
+# Some mothers also have multiple ages from SAIL provided ages
+
+# Check to see what some of these people with multiple dates look like to see if there's anything obvious amiss
+tmp <- data_all_clean_date %>%
+  group_by(MAT_ALF_PE) %>%
+  summarise(distinct_count = n_distinct(MAT_WOB)) %>%
+  filter(distinct_count == 2) %>%
+  pull(MAT_ALF_PE)
+
+data_all_clean_date %>%
+  filter(MAT_ALF_PE %in% tmp[1:5]) %>%
+  select(MAT_ALF_PE, MAT_WOB)
+
+# Ok, so we need to recode any with an empty string to missing, as that's showing up as two different dates and will throw an error if we use it to derive age from
+# Also derive age
+# Recode ages < 10 as NA
+data_all_clean_date <- data_all_clean_date %>%
+   mutate(MAT_WOB = ifelse(MAT_WOB == "", NA, MAT_WOB)) %>%
+   mutate(AGE_DERIVED = floor(as.numeric(difftime(WOB, MAT_WOB, units = "weeks"))/52)) %>%
+   mutate(MAT_AGE = ifelse(MAT_AGE < 10, NA, MAT_AGE)) %>%
+   mutate(AGE_DERIVED = ifelse(AGE_DERIVED < 10, NA, AGE_DERIVED))
+
+# Plot age and derived age against each other
+data_all_clean_date %>%
+  distinct(MAT_ALF_PE, WOB, MAT_AGE, AGE_DERIVED) %>%
+  ggplot(data = .,aes(x = MAT_AGE, y = AGE_DERIVED)) +
+  geom_point()
+
+# How many times does age and derived age match?
+data_all_clean_date %>%
+  distinct(MAT_ALF_PE, WOB, MAT_AGE, AGE_DERIVED) %>%
+  mutate(age_match = ifelse(MAT_AGE == AGE_DERIVED, TRUE, FALSE)) %>%
+  count(age_match)
+
+# Query with SAIL why there is a discrepancy here. In some cases it looks like there is a shift in multiples of 10 years, as there are lines of correlations but out by multiples of 10 years
+
+# Best solution would be to look at all ages (SAIL provided and derived from maternal WOB) for each delivery where there is more than one age available and choose the most common age.
+# However, when I tried running this code it was taking a very long time (possibly several hours).
+
+```
+
+# Add a column for previous psychiatric illness, any ICD-10 code starting with F (couldn't manage to do this in SQL)
+Note this is for any F code. If you want to change this then edit the SQL script in make_flat_table.sql where PEDW_SINGLE_DIAG_SUBSET_TMP table is made. Edit the code that includes any ICD-10 code begining with F to whatever you need instead. 
+Or change startsWith(DIAG_CD_1234, "F") here.
+Also update schematic diagram if changing this.
+
+```{r}
+# Note chose -39 weeks for before pregnancy and between -39 and -1 for during pregnancy
+# Any NAs returned are people without any hospital admissions for the ICD-10 codes we filtered for in SQL
+# Edit this to use gestational age to get a more accurate number 
+
+prevPsych <- function(DIAG_CD_1234, GAP_WEEKS){
+
+  prePreg <- any(GAP_WEEKS < -39 & startsWith(DIAG_CD_1234, "F")) # F-code before pregnancy
+  inPreg <- any(GAP_WEEKS >= -39 & GAP_WEEKS <= -1 & startsWith(DIAG_CD_1234, "F")) # F-code during pregnancy
+  preAndInPreg <- sum(c(prePreg, inPreg)) == 2 # F-code before and during pregnancy
+  if(preAndInPreg){
+    return <- "Before and during pregnancy"
+  }else if(prePreg){
+    return <- "Before pregnancy"
+  }else if(inPreg){
+    return <- "During pregnancy"
+  }else{
+    return <- "None"
+  }
+  return(return)
+}
+
+data_all_clean_date %>%
+   group_by(CHILD_ID_PE, DIAG_CD_1234, GAP_WEEKS) %>%
+   mutate(PREV_PSYCH = prevPsych(DIAG_CD_1234, GAP_WEEKS)) %>%
+   ungroup() %>%
+  select(MAT_ALF_PE, DELIVERY_NUM, DIAG_CD_1234, GAP_WEEKS, PREV_PSYCH, CASE_ANY_PPP) %>%
+  distinct(MAT_ALF_PE, DELIVERY_NUM, DIAG_CD_1234, GAP_WEEKS, PREV_PSYCH, CASE_ANY_PPP)
+ # Manually inspected output to check it looked sensible.
+
+data_all_clean_date <- data_all_clean_date %>%
+   group_by(CHILD_ID_PE, DIAG_CD_1234, GAP_WEEKS) %>%
+   mutate(PREV_PSYCH = prevPsych(DIAG_CD_1234, GAP_WEEKS)) %>%
+   ungroup() 
+
+```
+Note some mothers have an F ICD-10 code when GAP_WEEKS is zero, but not for PPP. They are coded as "None" in PREV_PYSCH.
+
+
+# Do something similar for the co-morbidity health data.
+ie. overwrite all values per mother per delivery if they have a CASE in one of the HEALTH_* columns
+Do we want to ensure the co-morbidity occurred when exactly? Is there a cut off date...? Vladi.. et al. looked at pregestational or gestational diabetes... so we could look at those time points?
+I've subsetted to look at cormobidities where PEDW START DATE is prior to WOB.
+
+```{r}
+# Increase speed of code execution by only looking at places where there is a CASE in a HEALTH_ column.
+
+HEALTH_cols <- data_all_clean_date %>%
+  select(starts_with("HEALTH_")) %>%
+  colnames()
+
+for(HEALTH in HEALTH_cols){
+
+IDs <- data_all_clean_date %>%
+  filter(!!sym(HEALTH) == "CASE" & PEDW_START_DATE < WOB) %>%
+  pull(CHILD_ID_PE) %>%
+  unique()
+
+data_all_clean_date <- data_all_clean_date  %>%
+    mutate(!!sym(HEALTH) := ifelse(CHILD_ID_PE %in% IDs, "CASE", "NOT_CASE"))
+
+}
+
+lapply(HEALTH_cols, function(X){
+  data_all_clean_date %>%
+    select(MAT_ALF_PE,WOB, starts_with("HEALTH_")) %>%
+    group_by(MAT_ALF_PE, WOB) %>%
+    summarise(distinct_count = n_distinct(!!sym(X))) %>%
+    count(distinct_count) %>%
+    group_by(distinct_count) %>%
+    count() %>%
+    mutate(Variable = X) 
+})
+# Good, each delivery has only one assignment of CASE or NOT_CASE each.
+```
+
+# Keep distinct cases of mother, child and demographic data. ie. remove nested admission data
+## Check there's only one entry for CASE_ANY_PPP per delivery
+
+```{r}
+# For each delivery (ie mother, WOB unique combination) make sure there's only one distinct CASE_ANY_PPP
+data_all_clean_date %>%
+  distinct(MAT_ALF_PE, WOB, CASE_ANY_PPP) %>%
+  nrow()
+
+data_all_clean_date %>%
+  distinct(MAT_ALF_PE, WOB) %>%
+  nrow()
+
+# The differences in the number of rows above tells us that within a delivery there can be a combination of not case, case 0-14 and case 15-52 weeks.
+# currently, the CASE_ANY_PPP column is defined based on DIAG_CD_1234 and GAP_WEEKS so is mixed within a delivery,  but it is possible there are still multiple values in the ICD-10 column per mother. ie. it's still nested
+
+# The order of priority for arranging the CASE_ANY_PPP column is:
+# arrange(factor(CASE_ANY_PPP, levels = c("PPP_0_14", "PPP_15_52", "NOT_CASE")))
+# Then keep the first occurrence
+
+data_all_clean_date_noNest <- data_all_clean_date %>%
+   arrange(factor(CASE_ANY_PPP, levels = c("PPP_0_14", "PPP_15_52", "NOT_CASE")), MAT_ALF_PE, CHILD_ID_PE,DELIVERY_NUM, BIRTH_ORDER) %>% # Order so case definitions appear first, and child delievered first (when multiple) also appears first
+   distinct(MAT_ALF_PE, CHILD_ID_PE, START_DATE, .keep_all = TRUE) 
+
+data_all_clean_date_noNest %>%
+  distinct(MAT_ALF_PE, WOB, CASE_ANY_PPP) %>%
+  nrow()
+
+data_all_clean_date_noNest %>%
+  distinct(MAT_ALF_PE, WOB) %>%
+  nrow()
+
+# # Check distinct numbers should all be one apart from child and demographic related variables
+# lapply(cols, function(X){
+#   data_all_clean_date_noNest %>%
+#     group_by(MAT_ALF_PE) %>%
+#     summarise(distinct_count = n_distinct(!!sym(X))) %>%
+#     count(distinct_count) %>%
+#     mutate(Variable = X)
+# })
+
+```
+
+# Identify the demographic data entry we want to keep
+Most people only have one demographic data entry, but some people have more than one. 
+Prioritise demographic data for dates where WOB is inside START and END DATE.
+Followed by demographic data collected prior to WOB
+Followed by demographic data collected after WOB.
+
+```{r demographic}
+# ----------------
+# Keep rows only where WOB between START_DATE and END_DATE
+between <- data_all_clean_date_noNest %>%
+  filter(WOB >= START_DATE & WOB <= END_DATE) %>%
+  mutate(DIF_DEMOGRAPHIC = 0) %>%
+  mutate(delivery_ID = paste0(MAT_ALF_PE, WOB))
+
+nrow(between %>%
+       distinct(MAT_ALF_PE, WOB))
+# 667,786 deliveries have demographic data spanning the time when delivery date occurs
+
+nrow(between %>%
+       distinct(delivery_ID))
+
+# ----------------
+# Keep the rows where START_DATE is before WOB, and MAT ID/WOB pair is not in the between data frame
+# However, we only want to keep one row per maternal ID and WOB distinct pair, and that row should be where the difference between WOB and START_DATE is the least
+
+before <- data_all_clean_date_noNest %>%
+  mutate(delivery_ID = paste0(MAT_ALF_PE, WOB)) %>%
+  filter(START_DATE <= WOB & (!delivery_ID %in% between$delivery_ID)) %>%
+  mutate(DIF_DEMOGRAPHIC = difftime(WOB, START_DATE)) %>%
+  arrange(MAT_ALF_PE, CHILD_ID_PE, DIF_DEMOGRAPHIC) %>%
+  distinct(MAT_ALF_PE, CHILD_ID_PE, .keep_all = TRUE)
+
+nrow(before %>%
+       distinct(MAT_ALF_PE, WOB))
+# 15,981 deliveries have demographic data before WOB
+
+# check that's the same as:
+nrow(before %>%
+       distinct(delivery_ID))
+
+# ----------------
+# Keep the rows where START_DATE is after WOB, and MAT ID is not in the between or before data frame
+after <- data_all_clean_date_noNest %>%
+  mutate(delivery_ID = paste0(MAT_ALF_PE, WOB)) %>%
+  filter(!delivery_ID %in% c(between$delivery_ID, before$delivery_ID)) %>%
+  filter(END_DATE > WOB) %>%
+  mutate(DIF_DEMOGRAPHIC = difftime(WOB, END_DATE)) %>%
+  arrange(MAT_ALF_PE, CHILD_ID_PE,DIF_DEMOGRAPHIC) %>%
+  distinct(MAT_ALF_PE, CHILD_ID_PE, .keep_all = TRUE)
+
+nrow(after%>%
+       distinct(MAT_ALF_PE, WOB))
+# 51,589 deliveries have demographic data after WOB
+
+# ----------------
+# People without demographic data
+without <- data_all_clean_date_noNest %>%
+  mutate(delivery_ID = paste0(MAT_ALF_PE, WOB)) %>%
+  filter(is.na(START_DATE) & (!delivery_ID %in% c(between$delivery_ID, before$delivery_ID, after$delivery_ID))) %>%
+  mutate(DIF_DEMOGRAPHIC = NA)
+
+nrow(without)
+nrow(without %>%
+       distinct(MAT_ALF_PE, WOB))
+# 3954 deliveries have no demographic data
+
+# ----------------
+# Check number of deliveries adds up the original data frame we had
+length(unique(between$delivery_ID)) +
+length(unique(before$delivery_ID)) +
+length(unique(after$delivery_ID)) +
+length(unique(without$delivery_ID))
+
+nrow(data_all_clean_date_noNest  %>%
+  mutate(delivery_ID = paste0(MAT_ALF_PE, WOB)) %>%
+       distinct(delivery_ID))
+# 739,310 deliveries 
+
+# Check number of children is the same too
+length(unique(between$CHILD_ID_PE)) +
+length(unique(before$CHILD_ID_PE)) +
+length(unique(after$CHILD_ID_PE)) +
+length(unique(without$CHILD_ID_PE))
+# 751165
+
+nrow(data_all_clean_date_noNest %>%
+       distinct(CHILD_ID_PE))
+# 751165
+
+# Great, we haven't lost anyone during that process!
+
+# ---------------- 
+# Re-join data
+data_all_clean_date_noNest_deprivation <- 
+  rbind(between, before, after, without)
+
+data_all_clean_date_noNest %>% nrow()
+data_all_clean_date_noNest_deprivation %>% nrow()
+# We do have less rows now though, yay!
+
+# ---------------- 
+# This method may seem a bit odd, to break up the data then bind it back together again
+# However, i tried a similar method to the above two nests by making a function and applying it over the grouped mat ID column. However, that didn't work as you can't use the grouped by chunk of data in a customised function. So then I tried lapply over over maternal IDs that had multiple deprivation index data... that didn't work either as it would take 2 hours to run! So chunking the data this way instead is much, much faster. See git commit "a4bd03" - "deprivation data is too nested" for code tthat tried these approaches.
+# Also to note this was when we were cleaning one delivery per mother, it gets even more complicated where looking at multiple deliveries per mother.
+
+```
+
+
+## Check we have got one row per mother and child now
+```{r}
+data_all_clean_date_noNest_deprivation %>%
+  nrow()
+# 751165, should be the same as below for number of births
+
+data_all_clean_date_noNest_deprivation %>%
+  distinct(MAT_ALF_PE, CHILD_ID_PE) %>%
+  nrow()
+# 751165 = number of births in data set
+
+data_all_clean_date_noNest_deprivation %>%
+  distinct(MAT_ALF_PE, WOB) %>%
+  nrow()
+# 739310 = number of deliveries in data set (this is less than number of births because of multiple births in some deliveries eg. twins)
+
+data_all_clean_date_noNest_deprivation %>%
+  distinct(MAT_ALF_PE) %>%
+  nrow()
+# 423441 = number of mothers
+
+# These numbers for births and mothers match the original number we had after applying the date filter, showing we haven't lost anyone during this data cleaning process.
+
+```
+
+
+## Count case numbers vs delivery number
+This includes recurrent cases
+second table reduces cell counts by collapsing multiple births >3 into one group
+```{r}
+data_all_clean_date_noNest_deprivation %>%
+  distinct(MAT_ALF_PE, WOB, .keep_all = TRUE) %>%
+  group_by(CASE_ANY_PPP, DELIVERY_NUM) %>%
+  summarise(n = n()) %>%
+  mutate(CASE_ANY_PPP = case_when(CASE_ANY_PPP == "NOT_CASE" ~ "Not case",
+                                  CASE_ANY_PPP == "PPP_0_14" ~ "PPP (0 - 14 weeks)",
+                                  CASE_ANY_PPP == "PPP_15_52" ~ "PPP (15 - 52 weeks)")) %>%
+  rename(`PPP case` = CASE_ANY_PPP) 
+
+data_all_clean_date_noNest_deprivation %>%
+  distinct(MAT_ALF_PE, WOB, .keep_all = TRUE) %>%
+  mutate(DELIVERY_NUM_CAT = ifelse(DELIVERY_NUM > 3, ">3", DELIVERY_NUM)) %>%
+  group_by(CASE_ANY_PPP, DELIVERY_NUM_CAT) %>%
+  summarise(n = n()) %>%
+  mutate(CASE_ANY_PPP = case_when(CASE_ANY_PPP == "NOT_CASE" ~ "Not case",
+                                  CASE_ANY_PPP == "PPP_0_14" ~ "PPP (0 - 14 weeks)",
+                                  CASE_ANY_PPP == "PPP_15_52" ~ "PPP (15 - 52 weeks)")) %>%
+  rename(`PPP case` = CASE_ANY_PPP) 
+
+```
+
+## To - do
+
+* Check missing data
+* QC other variables: maternal smoking, previous live birth, previous still births.
+* Decide how to QC age
+* QC ethnicity data
+* Create variables: age in categorical bins (started below)
+
+
+## When happy with cleaning above create object called data_clean
+
+* Make a column that collapses PPP 0-14 and 15-52 weeks into one
+```{r}
+data_clean <- data_all_clean_date_noNest_deprivation %>%
+  mutate(CASE_PPP = ifelse(CASE_ANY_PPP == "NOT_CASE", "NOT_CASE", "CASE"))
+```
+
+
+## Numbers of cases/not cases grouped by delivery number
+In this table numbers of mothers can be counted more than once, due to some mothers having more than one delivery. 
+This is why the total number from this table is greater than the number of mothers in the dataset.
+Each mother can move through being a case or not a case as delivery numbers increase. It also includes potential recurrent cases.
+Mothers with more than 3 deliveries are collapsed to reduce small cell counts in the second table.
+Note, we haven't checked the gestational age to be >= 24 weeks (which is used to define true parity).
+```{r}
+data_clean %>%
+  distinct(MAT_ALF_PE, WOB,  .keep_all = TRUE) %>% # keeping distinct occurances of MAT_ALF_PE and WOB
+  group_by(DELIVERY_NUM) %>%
+  summarise(`Not a case` = sum(CASE_ANY_PPP == "NOT_CASE"),
+            `PPP (0 - 14 weeks)` = sum(CASE_ANY_PPP == "PPP_0_14"),
+            `PPP (15 - 52 weeks)` = sum(CASE_ANY_PPP == "PPP_15_52"))
+
+
+data_clean %>%
+    distinct(MAT_ALF_PE, WOB,  .keep_all = TRUE) %>% # keeping distinct occurances of MAT_ALF_PE and WOB
+  mutate(DELIVERY_NUM_COLLAPSE = ifelse(DELIVERY_NUM > 3, "> 3", as.character(DELIVERY_NUM))) %>%
+  group_by(DELIVERY_NUM_COLLAPSE) %>%
+  summarise(`Not a case` = sum(CASE_ANY_PPP == "NOT_CASE"),
+            `PPP (0 - 14 weeks)` = sum(CASE_ANY_PPP == "PPP_0_14"),
+            `PPP (15 - 52 weeks)` = sum(CASE_ANY_PPP == "PPP_15_52"))
+
+
+```
+
+## Create other variables needed for demographic table
+### Check each variable looks sensible, compare against similar measures where appropriate, and create categorical variables where requested
+
+```{r}
+colnames(data_clean)
+```
+
+
+1.  Maternal age, converted to a categorical variable
+```{r mat_age}
+# We already cleaned age a bit, by using maternal WOB
+# For women with multiple MAT_WOB we used the most frequent age as long as it was > 10
+
+# Create a counts table
+ageCounts_MAT_AGE <- 
+data_clean %>%
+  mutate(MAT_AGE_CAT = as.factor(case_when(
+    between(MAT_AGE, 0, 10) ~ "0 - 10",
+    between(MAT_AGE, 11, 20) ~ "11 - 20",
+    between(MAT_AGE, 21, 25) ~ "21 - 25",
+    between(MAT_AGE, 26, 30) ~ "26 - 30",
+    between(MAT_AGE, 31, 35) ~ "31 - 35",
+    between(MAT_AGE, 36, 40) ~ "36 - 40",
+    between(MAT_AGE, 41, 45) ~ "41 - 45",
+    between(MAT_AGE, 46, 50) ~ "46 - 50",
+    between(MAT_AGE, 51, 60) ~ "51 - 60"
+  ))) %>%
+  group_by(MAT_AGE_CAT) %>%
+  summarise(N_mothers = n())%>%
+  mutate(MAT_AGE_CAT = as.factor(MAT_AGE_CAT))
+ageCounts_MAT_AGE
+
+# Categorise age:
+# Change this code after discussing how best to handle spurious ages and what categories we want
+data_clean <- data_clean %>%
+  mutate(MAT_AGE_CAT = as.factor(case_when(
+    AGE_DERIVED == 0 ~ "0",
+    between(AGE_DERIVED, 1, 20) ~ "1 - 20",
+    between(AGE_DERIVED, 21, 25) ~ "21 - 25",
+    between(AGE_DERIVED, 26, 30) ~ "26 - 30",
+    between(AGE_DERIVED, 31, 35) ~ "31 - 35",
+    between(AGE_DERIVED, 36, 40) ~ "36 - 40",
+    between(AGE_DERIVED, 41, 45) ~ "41 - 45",
+    between(AGE_DERIVED, 46, 50) ~ "46 - 50",
+    between(AGE_DERIVED, 51, 60) ~ "51 - 60"
+  ))) 
+
+data_clean %>%
+  count(MAT_AGE_CAT)
+
+data_clean %>%
+  filter(CASE_ANY_PPP == "NOT_CASE") %>%
+  ggplot(data = .) +
+  geom_bar(aes(x = MAT_AGE_CAT))
+
+data_clean %>%
+  filter(CASE_ANY_PPP != "NOT_CASE") %>%
+  ggplot(data = .) +
+  geom_bar(aes(x = MAT_AGE_CAT))
+
+# Need to decide what to do about the ages that seem spuriously low.
+# Count numbers are low for cases above 41, shall we collapse this into a bigger group?
+
+
+```
+
+3.  Still birth (categorical)
+```{r}
+# Still birth only
+data_clean %>%
+  group_by(CASE_ANY_PPP) %>%
+  count(STILLBIRTH_FLG)
+
+# Still birth & death of child within a week
+
+# check code:
+# data_clean %>%
+#   filter(as.numeric(difftime(DOD_CHILD_NCCH,WOB, units = "days")) <= 7) %>%
+#   select(WOB, DOD_CHILD_NCCH)
+```
+
+4.  Mode of delivery (categorical)
+```{r}
+data_clean %>%
+  count(DEL_CD)
+```
+
+Think carefully about how to report stats on multiple births per delivery:
+5.  Multiple births (categorical, yes/no)
+```{r}
+data_clean %>%
+   count(TOT_BIRTH_NUM)
+```
+
+6.  Gestational age, converted to categorical
+```{r}
+# Coding = term, extremely pre term (may include miscarriage cases), very pre term, pre term, late term
+# All births
+data_clean %>%
+  count(GEST_AGE_CAT)
+```
+
+Side note of miscarriages how are these coded, would DOD of child be before WOB? Or would WOB == DOD and it's coded as a still birth? I'm not sure we are looking at miscarriages and it might be hard to determine this so will leave it for now.
+
+
+7.  Birthweight (categorical)
+```{r}
+# SAIL derived variable coded: extremely low, very low, low, normal, high, very high
+data_clean %>%
+  count(BIRTH_WEIGHT_CAT)
+```
+
+
+9.  Maternal ethnicity (categorical)
+```{r ethnicity}
+# Not yet joined into main flat table, this is because some people had more than one ethnic code.
+# This table can be read into R and a plot can be made to explore in more detail: SAILW1515V.PEDW_SINGLE_DIAG_SUBSET_ETH_TMP made in Scripts/Data_Cleaning_SQL/make_flat_table.sql 
+
+ethnicityData <- fread("S:/1515 - Postpartum psychosis- physical and mental comorbidity in a national linked d/Exports_from_Eclipse/PEDW_SINGLE_DIAG_SUBSET_ETH_TMP.csv")
+
+# Subset to mothers only
+ethnicityData <- ethnicityData %>%
+  filter(ALF_PE %in% unique(data_all$MAT_ALF_PE))
+
+ethnicityData %>%
+  distinct(ALF_PE) %>%
+  nrow() # 217,474 mothers have ethnicity data from hospital admissions
+
+# -----------------------------------------
+# What are the options for the ethnicity codes?
+unique(ethnicityData$ETH_GRP_DERIVED_DESC) %>% sort()
+
+# -----------------------------------------
+# We could collapse any missing into jsut one missing category
+missingNames <- c("(Blank)", "(Invalid)", "Not given", "Not Stated")
+
+ethnicityData <- ethnicityData %>%
+  mutate(ETH_GRP_DERIVED_DESC = ifelse(ETH_GRP_DERIVED_DESC %in% missingNames, NA, ETH_GRP_DERIVED_DESC))
+
+# -----------------------------------------
+# How many ethnicity codes do mother's have?
+ethFreq <- ethnicityData %>%
+  distinct(ALF_PE, ETH_GRP_DERIVED_DESC, .keep_all = TRUE) %>%
+  group_by(ALF_PE) %>%
+  summarise(n = n_distinct(ETH_GRP_DERIVED_DESC)) %>%
+  count(n)
+
+ethFreq
+
+# -----------------------------------------
+# Check if the duplications are easy to process:
+ethMultIDs <- ethnicityData %>%
+  group_by(ALF_PE) %>%
+  summarise(n = n_distinct(ETH_GRP_DERIVED_DESC)) %>%
+  filter(n > 1) %>%
+  pull(ALF_PE)
+
+
+ethnicityData %>%
+  filter(ALF_PE %in% ethMultIDs) %>%
+  distinct(ALF_PE, ETH_GRP_DERIVED_DESC) %>%
+  arrange(ALF_PE)
+
+# Lot's of NA
+
+# -----------------------------------------
+# If someone has more than one ethnicity code and one of those is NA, then remove the rows with NA
+ethnicityDataProcessed <- ethnicityData %>%
+  filter(!(ALF_PE %in% ethMultIDs & is.na(ETH_GRP_DERIVED_DESC)))
+
+# N mothers with ethnicity data 
+ethnicityDataProcessed %>%
+  distinct(ALF_PE,.keep_all = T) %>%
+  filter(!is.na(ETH_GRP_DERIVED_DESC)) %>%
+  nrow() 
+
+# N mothers coded with missing ethnicity data:
+ethnicityDataProcessed %>%
+  distinct(ALF_PE,.keep_all = T) %>%
+  filter(is.na(ETH_GRP_DERIVED_DESC)) %>%
+  nrow() 
+
+# Also calculate N mothers not in this dataset but also have missing ethnicity data:
+
+# -----------------------------------------
+# Re-do counts 
+ethFreq <- ethnicityDataProcessed %>%
+  filter(!is.na(ETH_GRP_DERIVED_DESC)) %>%
+  distinct(ALF_PE, ETH_GRP_DERIVED_DESC, .keep_all = TRUE) %>%
+  group_by(ALF_PE) %>%
+  summarise(n = n_distinct(ETH_GRP_DERIVED_DESC)) %>%
+  count(n)
+
+# Collapse small counts
+freqSmall <- ethFreq %>%
+  filter(n >= 3) %>%
+  summarise_all(sum) %>%
+  pull(nn)
+  
+ethFreqSmall <- data.frame(n = ">= 3", nn = freqSmall)
+
+ethFreqSmall <- rbind(
+  ethFreq %>%
+    filter(n < 3),
+  ethFreqSmall) %>%
+  mutate(n = factor(n, levels = c(1:5,">= 3"))) %>%
+rename(`Number of ethnicity codes per mother` = n,
+        `Number of mothers` = nn)
+
+ethFreqSmall
+
+# -----------------------------------------
+# Nice, most people now only have one ethnicity data entry, but still a lot of duplicates
+# Can we count the number of people for each 2 way combination of these?
+
+ethMultIDsProcessed <- ethnicityDataProcessed %>%
+  group_by(ALF_PE) %>%
+  summarise(n = n_distinct(ETH_GRP_DERIVED_DESC)) %>%
+  filter(n == 2) %>%
+  pull(ALF_PE)
+
+ethConcat <- ethnicityDataProcessed %>%
+  filter(ALF_PE %in% ethMultIDsProcessed) %>%
+  distinct(ALF_PE, ETH_GRP_DERIVED_DESC) %>%
+  group_by(ALF_PE) %>%
+  arrange(ETH_GRP_DERIVED_DESC) %>%
+  summarise(Ethnicity = paste(ETH_GRP_DERIVED_DESC, collapse = ", "))
+
+ethConcat %>%
+  count(Ethnicity) %>%
+  arrange(desc(n))
+
+# -----------------------------------------
+# For people with only one ethnicity code what are the counts:
+ethnicityDataProcessed %>%
+  filter(!is.na(ETH_GRP_DERIVED_DESC)) %>%
+  filter(!ALF_PE %in% ethMultIDsProcessed) %>%
+  distinct(ALF_PE, ETH_GRP_DERIVED_DESC) %>%
+  arrange(ALF_PE) %>%
+  count(ETH_GRP_DERIVED_DESC) %>%
+  arrange(ETH_GRP_DERIVED_DESC)
+```
+
+10. Maternal deprivation at time of birth - quintiles, compare WIMD and
+    Townsend (categorical)
+    There's the choice of WIMD2014 or WIMD2019. Compare them both to see if there's a difference.
+    
+
+```{r}
+# Save final cleaned object (data_clean) to  S:\1515 - Postpartum psychosis- physical and mental comorbidity in a national linked/Cleaned_data/data_all_del_clean_final.csv
+
+write.csv(data_clean, "S:/1515 - Postpartum psychosis- physical and mental comorbidity in a national linked d/Cleaned_data/data_all_del_clean_final.csv", row.names = F, quote = F)
+```
+
+
+
+
