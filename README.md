@@ -4,7 +4,7 @@
 
 This repo contains scripts I wrote for a project developed and led by my colleague, Dr Katie Marwick, investigating post-partum psychosis. These scripts detail the data cleaning process.
 
-For more info please see my blog post on [my website](https://ameliaes.github.io/posts/SQL-project).
+For more info please see my blog post on [my website](https://ameliaes.github.io/SQL-project).
 
 ______________________________
 
