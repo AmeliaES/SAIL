@@ -1,4 +1,4 @@
-# Postpartum psychosis project
+# Post-partum psychosis project
 
 ## Summary
 
